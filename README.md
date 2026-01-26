@@ -1,6 +1,6 @@
 # 验迹 (VeriTrail) 核验核心组件
 
-![Platform](https://img.shields.io/badge/platform-iOS%20%7C%20macOS-lightgrey)
+![Platform](https://img.shields.io/badge/platform-iOS-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Standard](https://img.shields.io/badge/standard-RFC%203161-blue)
 
