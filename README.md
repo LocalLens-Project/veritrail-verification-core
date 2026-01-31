@@ -53,7 +53,7 @@ Running VeriTrail Verification Protocol v1.0
 
 ## 📂 验证包样本 (Sample Evidence)
 
-为了方便测试与审计，我们提供了一个经过签名的标准验证包样本（即上述输出示例对应的案件包）。您可以在本仓库的 [Releases](https://github.com/LocalLens-Project/veritrail-verification-core/releases/download/v1.0.0/veritrail-verify.zip) 页面 下载 `veritrail-verify.zip` 进行试运行。
+为了方便测试与审计，我们提供了一个经过签名的标准验证包样本（即上述输出示例对应的案件包）。您可以在本仓库的 [Releases](https://github.com/LocalLens-Project/veritrail-verification-core/releases/) 页面 下载 `veritrail-verify.zip` 进行试运行。
 
 该样本包包含了本脚本的源代码作为“证据文件”，实现了代码自证（Self-Verification）。
 
