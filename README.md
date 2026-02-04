@@ -37,23 +37,24 @@ python3 veritrail-verify.py "/path/to/your/evidence_folder"
 运行成功后，终端将输出如下详细审计日志（以包含 TSA 时间戳的案件为例）：
 
 ```
-Running VeriTrail Verification Protocol v1.0
+Running VeriTrail Verification Protocol v1.1
 ============================================================
 案件 [1/1]: veritrail-verify
 ------------------------------------------------------------
 [1] veritrail-verify.py  
     ✅ 文件完整  
     ✅ 创世节点  
-    ✅ 指纹验证通过  
-    🛡️ TSA 校验通过 (时间 : 2026-01-22 07:23:09+00:00, 权威机构签名有效)
+    ✅ 指纹验证通过
+    🔐 签名验证通过  
+    🛡️ TSA 校验通过 (时间 : 2026-02-04 10:47:27+00:00, 权威机构签名有效)
 
 ============================================================
-🏆 验证成功！所有数据完整，哈希链闭合，数字签名有效。
+🏆 验证成功！所有数据完整，哈希链闭合。
 ```
 
 ## 📂 验证包样本 (Sample Evidence)
 
-为了方便测试与审计，我们提供了一个经过签名的标准验证包样本（即上述输出示例对应的案件包）。您可以在本仓库的 [Releases](https://github.com/LocalLens-Project/veritrail-verification-core/releases/) 页面 下载 `veritrail-verify.zip` 进行试运行。
+为了方便测试与审计，我们提供了一个经过签名的标准验证包样本（即上述输出示例对应的案件包）。您可以在本仓库的 [Releases](https://github.com/LocalLens-Project/veritrail-verification-core/releases/) 页面 下载 `veritrail-verify-v1.1.zip` 进行试运行。
 
 该样本包包含了本脚本的源代码作为“证据文件”，实现了代码自证（Self-Verification）。
 
