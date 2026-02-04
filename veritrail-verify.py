@@ -8,6 +8,10 @@ import base64
 try:
     from asn1crypto import cms, tsp
     from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.exceptions import InvalidSignature
 except ImportError:
     print("❌ 错误: 缺少必要的库。")
     print("请运行: pip install asn1crypto cryptography")
@@ -33,7 +37,9 @@ KEYS = {
     "case_name": "name",
     "ts_token": "timestampToken",
     "ts_nonce": "timestampNonce",
-    "ts_date": "timestampDate"
+    "ts_date": "timestampDate",
+    "signature": "signature",
+    "public_key": "publicKey"
 }
 
 # ==================== 核心算法 ====================
@@ -58,6 +64,90 @@ def calculate_entry_hash(prev_hash, iso_date, file_hash, file_name, file_size):
     # 逻辑公式: previousHash|isoDate|fileHash|fileName|fileSize
     content = f"{prev_hash}|{iso_date}|{file_hash}|{file_name}|{str(file_size)}"
     return hashlib.sha256(content.encode('utf-8')).hexdigest().lower()
+
+def verify_ecdsa_signature(signature_b64, public_key_b64, entry_hash_hex):
+    """
+    验证 P-256 ECDSA 签名
+    - signature_b64: Base64 编码的原始签名 (64 字节, r||s 格式)
+    - public_key_b64: Base64 编码的公钥 (33 字节 SEC 1 压缩格式，或 32 字节 Apple compact 格式)
+    - entry_hash_hex: 条目哈希的十六进制字符串 (签名时使用 UTF-8 编码的此字符串)
+    """
+    try:
+        # 解码 Base64
+        signature_raw = base64.b64decode(signature_b64)
+        public_key_data = base64.b64decode(public_key_b64)
+
+        # 验证签名大小
+        if len(signature_raw) != 64:
+            return False, f"签名大小错误: {len(signature_raw)} 字节 (期望 64)"
+
+        # 签名是 r||s 格式，需要转换为 DER 格式
+        r = int.from_bytes(signature_raw[:32], 'big')
+        s = int.from_bytes(signature_raw[32:], 'big')
+
+        from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+        der_signature = encode_dss_signature(r, s)
+
+        # 签名时使用的是 entry_hash 的 UTF-8 编码
+        message = entry_hash_hex.encode('utf-8')
+
+        # P-256 曲线参数
+        p = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff
+        a = 0xffffffff00000001000000000000000000000000fffffffffffffffffffffffc
+        b = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b
+
+        if len(public_key_data) == 33:
+            # SEC 1 标准压缩格式: 02/03 前缀 + x 坐标
+            prefix = public_key_data[0]
+            if prefix not in (0x02, 0x03):
+                return False, f"无效的压缩公钥前缀: 0x{prefix:02x}"
+
+            x = int.from_bytes(public_key_data[1:33], 'big')
+
+            # 计算 y^2 = x^3 + ax + b (mod p)
+            y_squared = (pow(x, 3, p) + a * x + b) % p
+            y = pow(y_squared, (p + 1) // 4, p)
+
+            # 根据前缀选择正确的 y
+            y_is_even = (y % 2 == 0)
+            if (prefix == 0x02 and not y_is_even) or (prefix == 0x03 and y_is_even):
+                y = p - y
+
+            x_bytes = x.to_bytes(32, 'big')
+            y_bytes = y.to_bytes(32, 'big')
+            uncompressed_key = b'\x04' + x_bytes + y_bytes
+
+            public_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), uncompressed_key)
+            public_key.verify(der_signature, message, ec.ECDSA(hashes.SHA256()))
+            return True, "签名验证通过"
+
+        elif len(public_key_data) == 32:
+            # Apple CryptoKit compact 格式 (仅 x 坐标，需尝试两个 y 值)
+            x = int.from_bytes(public_key_data, 'big')
+
+            y_squared = (pow(x, 3, p) + a * x + b) % p
+            y = pow(y_squared, (p + 1) // 4, p)
+
+            x_bytes = x.to_bytes(32, 'big')
+
+            for y_candidate in [y, p - y]:
+                try:
+                    y_bytes = y_candidate.to_bytes(32, 'big')
+                    uncompressed_key = b'\x04' + x_bytes + y_bytes
+                    public_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), uncompressed_key)
+                    public_key.verify(der_signature, message, ec.ECDSA(hashes.SHA256()))
+                    return True, "签名验证通过"
+                except InvalidSignature:
+                    continue
+
+            return False, "签名无效"
+        else:
+            return False, f"公钥大小错误: {len(public_key_data)} 字节 (期望 33 或 32)"
+
+    except InvalidSignature:
+        return False, "签名无效"
+    except Exception as e:
+        return False, f"签名验证异常: {str(e)}"
 
 def verify_tsa_token(token_b64, expected_entry_hash_hex, expected_nonce):
     try:
@@ -133,7 +223,7 @@ def verify_backup(backup_root):
         return
 
     cases = data.get(KEYS["cases"], [])
-    print(f"Running VeriTrail Verification Protocol v1.0")
+    print(f"Running VeriTrail Verification Protocol v1.1")
     print("="*70)
 
     total_errors = 0
@@ -195,6 +285,18 @@ def verify_backup(backup_root):
             else:
                 print(f"    ✅ 指纹验证通过")
 
+            # 验证 ECDSA 签名
+            signature_b64 = entry.get(KEYS["signature"])
+            public_key_b64 = entry.get(KEYS["public_key"])
+            if signature_b64 and public_key_b64:
+                is_valid, msg = verify_ecdsa_signature(signature_b64, public_key_b64, rec_entry_hash)
+                if is_valid:
+                    print(f"    🔐 {msg}")
+                else:
+                    print(f"    ⚠️ [签名校验失败] {msg}")
+            else:
+                print(f"    ⚪ 无数字签名")
+
             if ts_token_b64:
                 is_valid, msg = verify_tsa_token(ts_token_b64, calc_entry_hash, ts_nonce)
                 if is_valid:
@@ -209,7 +311,7 @@ def verify_backup(backup_root):
 
     print("\n" + "="*70)
     if total_errors == 0:
-        print(f"🏆 验证成功! 所有数据完整，哈希链闭合，数字签名有效。")
+        print(f"🏆 验证成功! 所有数据完整，哈希链闭合。")
     else:
         print(f"⚠️ 验证失败! 发现 {total_errors} 处异常。")
         sys.exit(1)
