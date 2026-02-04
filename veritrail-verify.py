@@ -6,7 +6,7 @@ import datetime
 import base64
 
 try:
-    from asn1crypto import cms, tsp
+    from asn1crypto import cms, tsp, x509
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.hazmat.primitives import hashes
@@ -16,6 +16,9 @@ except ImportError:
     print("❌ 错误: 缺少必要的库。")
     print("请运行: pip install asn1crypto cryptography")
     sys.exit(1)
+
+# TSA 时间戳签名 EKU OID (id-kp-timeStamping)
+TSA_TIMESTAMPING_EKU_OID = "1.3.6.1.5.5.7.3.8"
 
 # ==================== 配置与常量 ====================
 
@@ -153,7 +156,7 @@ def verify_tsa_token(token_b64, expected_entry_hash_hex, expected_nonce):
     try:
         # 1. 解码 Base64
         token_data = base64.b64decode(token_b64)
-        
+
         # 2. 解析 TimeStampResp
         ts_resp = tsp.TimeStampResp.load(token_data)
         status = ts_resp['status']
@@ -164,39 +167,64 @@ def verify_tsa_token(token_b64, expected_entry_hash_hex, expected_nonce):
         cms_content_info = ts_resp['time_stamp_token']
         if cms_content_info['content_type'].native != 'signed_data':
             return False, "非 SignedData 类型"
-            
+
         signed_data = cms_content_info['content']
         encap_content_info = signed_data['encap_content_info']
         if encap_content_info['content_type'].native != 'tst_info':
             return False, "封装内容不是 TSTInfo"
-            
+
         # 4. 获取 TSTInfo
         content_raw = encap_content_info['content'].parsed
-        
+
         if isinstance(content_raw, bytes):
             tst_info = tsp.TSTInfo.load(content_raw)
         else:
             tst_info = content_raw
-        
+
         # 5. 校验 MessageImprint (核心！证明这个时间戳是签给这个哈希的)
         message_imprint = tst_info['message_imprint']
         # hash_algorithm = message_imprint['hash_algorithm']['algorithm'].native
         hashed_message = message_imprint['hashed_message'].native
-        
+
         # 将我们计算的 entry_hash (Hex 字符串) 转为 bytes
         expected_hash_bytes = bytes.fromhex(expected_entry_hash_hex)
-        
+
         if hashed_message != expected_hash_bytes:
             return False, f"哈希不匹配! TSA中为: {hashed_message.hex()}, 期望: {expected_entry_hash_hex}"
-            
+
         # 6. 校验 Nonce (防重放)
         tsa_nonce = tst_info['nonce'].native
         if expected_nonce is not None and tsa_nonce != expected_nonce:
             return False, f"Nonce 不匹配! TSA中为: {tsa_nonce}, 记录为: {expected_nonce}"
 
-        # 7. 获取时间
+        # 7. 校验签名者证书的 EKU (Extended Key Usage)
+        # 与 iOS 端保持一致，要求签名者证书必须包含 id-kp-timeStamping (1.3.6.1.5.5.7.3.8)
+        certificates = signed_data['certificates']
+        eku_valid = False
+        if certificates:
+            for cert_choice in certificates:
+                if cert_choice.name == 'certificate':
+                    cert = cert_choice.chosen
+                    tbs_cert = cert['tbs_certificate']
+                    extensions = tbs_cert['extensions']
+                    if extensions:
+                        for ext in extensions:
+                            if ext['extn_id'].native == 'extended_key_usage':
+                                eku_value = ext['extn_value'].parsed
+                                if eku_value:
+                                    eku_oids = [oid.native for oid in eku_value]
+                                    if 'time_stamping' in eku_oids or TSA_TIMESTAMPING_EKU_OID in eku_oids:
+                                        eku_valid = True
+                                        break
+                if eku_valid:
+                    break
+
+        if not eku_valid:
+            return False, "签名者证书缺少 id-kp-timeStamping EKU"
+
+        # 8. 获取时间
         gen_time = tst_info['gen_time'].native
-        
+
         return True, f"TSA 校验通过 (时间: {gen_time}, 权威机构签名有效)"
 
     except Exception as e:
