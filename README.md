@@ -54,8 +54,23 @@ Running VeriTrail Verification Protocol v1.1
 
 ## 📂 验证包样本 (Sample Evidence)
 
-为了方便测试与审计，我们提供了一个经过签名的标准验证包样本（即上述输出示例对应的案件包）。您可以在本仓库的 [Releases](https://github.com/LocalLens-Project/veritrail-verification-core/releases/) 页面 下载 `veritrail-verify-v1.1.1.zip` 进行试运行。
+为了方便测试与审计，我们提供了一个经过签名的标准验证包样本（即上述输出示例对应的案件包）。您可以在本仓库的 [Releases](https://github.com/LocalLens-Project/veritrail-verification-core/releases/) 页面 下载 `veritrail-verify-1.1.1.zip` 进行试运行。
 
 该样本包包含了本脚本的源代码作为“证据文件”，实现了代码自证（Self-Verification）。
+
+## ⚠️ 免责声明 (Disclaimer)
+
+1.  **技术边界**：本工具仅用于验证验迹 App 生成数据的**电子完整性**与**未篡改性**。验证通过仅代表数据自生成后未被修改，并不代表对现实世界事件真实性的背书。
+2.  **法律效力**：尽管本工具遵循 ISO/IEC 27037 数字取证标准，但数字证据在法律诉讼中的采信度取决于当地法律法规及司法鉴定的具体要求。
+3.  **使用责任**：开发者不对因使用本工具产生的直接或间接后果承担法律责任。
+
+## 🤝 贡献与反馈
+
+本存储库作为验迹 (VeriTrail) 的核心开源组件，欢迎安全审计与代码贡献。
+
+* **Bug 反馈**：如果您发现验证逻辑存在漏洞，请通过 [Issues](../../issues) 提交报告。
+* **代码贡献**：欢迎提交 Pull Request，请确保您的代码包含相应的单元测试。
+* **联系与支持**：如有其他疑问或需要私下联络，请发送邮件至 `help@locallens.cn`。
+    > **安全通信建议**：**若涉及敏感技术问题，建议注册使用 Tuta Mail 与我们联系。作为开源端到端加密邮件服务，它能确保邮件在传输过程中全程加密，且仅能由我方解密查阅。**
 
 © 2026 LocalLens Project. Distributed under the MIT License.
