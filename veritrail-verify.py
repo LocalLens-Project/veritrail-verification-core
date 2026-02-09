@@ -42,7 +42,15 @@ KEYS = {
     "ts_nonce": "timestampNonce",
     "ts_date": "timestampDate",
     "signature": "signature",
-    "public_key": "publicKey"
+    "public_key": "publicKey",
+    "capture_source": "captureSource"
+}
+
+CAPTURE_SOURCE_LABELS = {
+    "photo": "App 直接拍照（传感器直连）",
+    "video": "App 直接录像（传感器直连）",
+    "audio": "App 直接录音（传感器直连）",
+    "imported": "导入文件"
 }
 
 # ==================== 核心算法 ====================
@@ -67,6 +75,12 @@ def calculate_entry_hash(prev_hash, iso_date, file_hash, file_name, file_size):
     # 逻辑公式: previousHash|isoDate|fileHash|fileName|fileSize
     content = f"{prev_hash}|{iso_date}|{file_hash}|{file_name}|{str(file_size)}"
     return hashlib.sha256(content.encode('utf-8')).hexdigest().lower()
+
+def normalize_capture_source(raw_value):
+    if not isinstance(raw_value, str):
+        return None
+    normalized = raw_value.strip().lower()
+    return normalized if normalized in CAPTURE_SOURCE_LABELS else None
 
 def verify_ecdsa_signature(signature_b64, public_key_b64, entry_hash_hex):
     """
@@ -251,7 +265,7 @@ def verify_backup(backup_root):
         return
 
     cases = data.get(KEYS["cases"], [])
-    print(f"Running VeriTrail Verification Protocol v1.1")
+    print(f"Running VeriTrail Verification Protocol v1.1.1")
     print("="*70)
 
     total_errors = 0
@@ -275,9 +289,18 @@ def verify_backup(backup_root):
             rec_entry_hash = entry.get(KEYS["entry_hash"])
             ts_token_b64 = entry.get(KEYS["ts_token"])
             ts_nonce = entry.get(KEYS["ts_nonce"])
+            capture_source_raw = entry.get(KEYS["capture_source"])
             iso_date = cocoa_to_iso8601(cocoa_time)
 
             print(f"[{i+1}] {fname}")
+
+            capture_source = normalize_capture_source(capture_source_raw)
+            if capture_source:
+                print(f"    📍 采集来源: {CAPTURE_SOURCE_LABELS[capture_source]}")
+            elif capture_source_raw is None:
+                print(f"    ⚪ 采集来源: 未记录 (旧版本备份)")
+            else:
+                print(f"    ⚠️ [采集来源字段异常] {capture_source_raw}")
             
             real_file_path = os.path.join(files_root, rel_path)
             if os.sep != '/': real_file_path = real_file_path.replace('/', os.sep)
