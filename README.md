@@ -4,87 +4,137 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Standard](https://img.shields.io/badge/standard-RFC%203161-blue)
 
-> **验迹 (VeriTrail) 数字取证系统的官方开源核验工具包。**
+> 验迹 (VeriTrail) iOS 端导出包的官方离线核验脚本与说明。
 >
-> 本项目包含核心校验逻辑，允许第三方机构在**完全离线**环境下，独立验证由验迹 iOS App 生成的数字证据包在完整性、链条连续性、签名真实性与时间有效性方面是否可信。
+> 目标是让第三方在**不联网**条件下，独立验证证据包的内容完整性、哈希链连续性、主签名、硬件背书签名、时间戳回执，以及关键设备元数据。
 
 ## 核心能力
 
-本工具遵循 **ISO/IEC 27037** 数字取证国际标准参考设计，核心逻辑透明可见：
+- 离线核验：全程本地计算，不上传文件。
+- 链式完整性：验证 `fileHash`、`entryHash`、`previousHash` 与链条顺序。
+- 主签名验签：验证条目哈希上的 ECDSA P-256 主签名（设备签名）。
+- 硬件背书验签：验证第二签名槽（`hardwareEndorsement*`），支持 `publicKey` 与 `certificate` 路径。
+- 可信时间戳校验：校验 RFC 3161 `timestampToken` 的 imprint、nonce、CMS 签名、证书链信任与 EKU（`id-kp-timeStamping`）。
+- 元数据审计：输出设备型号/系统/设备指纹ID、签名模式、10分钟窗口相关字段、采集来源。
+- 兼容旧备份：字段缺失时按“旧版本备份”处理，并给出告警而非直接中断。
 
-- **离线核验 (Offline Verification)**：全程本地计算与校验，无需联网，降低证据泄露风险。
-- **链式完整性 (Chain Integrity)**：校验 SHA-256 哈希链（内容 + 关键元数据 + 前序关系），防止篡改与未授权重排。
-- **签名审计 (Signature Audit)**：验证对链条指纹的 ECDSA P-256 数字签名，用于锚定记录来源与不可抵赖性（若缺签名则仅能证明一致性）。
-- **时间戳校验 (RFC 3161，可选)**：验证第三方可信时间戳回执（TSA token）的有效性。
-- **采集来源识别 (Capture Source Traceability)**：支持识别 `photo` / `video` / `audio` / `imported`，并在核验输出中展示来源信息。
-- **新旧备份兼容**：旧备份缺少 `captureSource` 字段时，脚本按“未记录(旧版本备份)”处理，不影响哈希链/签名/TSA 校验。
+## 双重签名说明（YubiKey 硬件背书）
 
-## iOS 端对齐更新（2026-02）
+当用户启用 YubiKey 硬件背书并形成“主签名 + 硬件背书签名”双重签名时，证据在技术抗篡改与抗抵赖层面的强度最高。  
+在司法或合规场景中，这通常意味着更高的技术证明力与更清晰的签名主体隔离。  
+但最终法律效力仍由具体司法辖区、取证程序、证据规则与审理机关综合认定。
 
-本 README 已与 iOS 端与核验脚本最新实现对齐，关键变更如下：
+## 与 iOS v1.3.0 对齐
 
-1. **Python 核验脚本同步支持来源识别**  
-   `veritrail-verify.py` 已支持读取并输出 `captureSource`，并对异常值给出提示。
+本仓库已对齐当前 iOS 端的大改动：
+
+1. 设备签名元数据
+- `deviceModelCode`
+- `deviceModelName`
+- `deviceSystemVersion`
+- `deviceFingerprintID`
+- `deviceSignatureMode` (`secure_enclave` / `software_fallback` / `unknown`)
+
+2. 10分钟窗口相关元数据
+- `captureMonotonicNanos`
+- `captureBootSessionID`
+- `onsiteWindowSeconds`
+
+3. 硬件背书（第二签名）
+- `hardwareEndorsementSignature`
+- `hardwareEndorsementPublicKey`
+- `hardwareEndorsementCertificate`
+- `hardwareEndorsementKeyName`
+- `hardwareEndorsementSignedAt`
+- `hardwareEndorsementLevel` (`onsite_witness` / `post_archived`)
+- `hardwareEndorsementError`
+
+4. 采集来源字段
+- `captureSource`: `photo` / `video` / `audio` / `imported`
 
 ## 使用方法
 
-### 1. 环境准备
-
-需要 Python 3.6+ 环境以及密码学库支持：
+### 1) 依赖
 
 ```bash
 pip install cryptography asn1crypto
 ```
 
-### 2. 运行核验
-
-将导出的案件包（解压后的文件夹）路径作为参数传入：
+### 2) 运行
 
 ```bash
-python3 veritrail-verify.py "/path/to/your/evidence_folder"
+python3 veritrail-verify.py "/path/to/VeriTrail_Backup"
 ```
 
-### 3. 输出示例
+备份目录应至少包含：
+- `data.json`
+- `files/`
 
-运行成功后，终端将输出如下详细审计日志（示例包含采集来源与 TSA）：
+### 3) 结果解释
+
+- `✅`：关键校验通过。
+- `⚠️`：告警（字段异常、兼容性问题、非关键信息不完整）。
+- `❌`：关键错误（文件/链条/签名/TSA 校验失败）。
+
+只要出现 `❌`，脚本退出码为 `1`。
+
+## 输出示例（节选）
 
 ```text
-Running VeriTrail Verification Protocol v1.1.1
-============================================================
+Running VeriTrail Verification Protocol v1.3.0
+Backup format version: 3
+==============================================================================
 案件 [1/1]: Demo Case
-------------------------------------------------------------
-[1] 录音_20260209_135901.m4a
-    📍 采集来源: App 直接录音（传感器直连）
+------------------------------------------------------------------------------
+[1] 照片_20260212_214012.jpg
+    🕒 记录时间: 2026-02-12 13:40:12 UTC
+    📍 采集来源: App 直接拍照（传感器直连）
     ✅ 文件完整
     ✅ 创世节点
     ✅ 指纹验证通过
-    🔐 签名验证通过
-    🛡️  TSA 校验通过 (时间: 2026-02-09 05:59:27+00:00, 权威机构签名有效)
+    🔐 主签名: 签名验证通过
+    📱 设备签名元数据: iPad Pro 11寸 (第三代, M1) • iOS 26.2.1 • Secure Enclave（原生保护）
+    ⏱️ 现场窗口元数据: captureMonotonicNanos=1406712821488000, captureBootSessionID=1769496921, onsiteWindowSeconds=600
+    🪪 硬件背书: 现场身份亲签 • YubiKey 5C Nano · FW 5.4.3 • 2026-02-12 13:40:44 UTC
+    🪪 硬件签名校验: 签名验证通过 (publicKey)
+    🪪 硬件证书: 已附带并解析成功
+    🪪 硬件签名校验: 证书验签通过 (certificate)
+    🪪 硬件公钥与证书公钥一致
+    🪪 硬件背书时间差: XXs
+    🛡️  TSA 校验通过 (时间: 2026-02-12T13:40:12+00:00, CMS 签名验证通过; 证书链验证通过 (certifi, openssl verify))
 
-============================================================
-🏆 验证成功! 所有数据完整，哈希链闭合。
+==============================================================================
+🏆 验证成功! 所有关键校验项通过。
 ```
 
-## 备份格式兼容说明
+## data.json 关键字段（当前脚本识别）
 
-当前脚本识别以下关键字段（位于 `data.json` 的 entry 节点）：
+- 基础完整性：
+`fileHash` `entryHash` `previousHash` `timestamp` `fileName` `fileSize` `relativeFilePath`
 
-- `fileHash` / `entryHash` / `previousHash`
-- `signature` / `publicKey`
-- `timestampToken` / `timestampNonce`
-- `captureSource`（可选）
+- 主签名：
+`signature` `publicKey`
 
-`captureSource` 取值约定：
+- 设备签名元数据：
+`deviceModelCode` `deviceModelName` `deviceSystemVersion` `deviceFingerprintID` `deviceSignatureMode`
 
-- `photo`：App 直接拍照
-- `video`：App 直接录像
-- `audio`：App 直接录音
-- `imported`：导入文件
+- 10分钟窗口：
+`captureMonotonicNanos` `captureBootSessionID` `onsiteWindowSeconds`
 
-兼容策略：
+- 硬件背书：
+`hardwareEndorsementSignature` `hardwareEndorsementPublicKey` `hardwareEndorsementCertificate`
+`hardwareEndorsementKeyName` `hardwareEndorsementSignedAt` `hardwareEndorsementLevel` `hardwareEndorsementError`
 
-- 缺失该字段：输出 `采集来源: 未记录 (旧版本备份)`。
-- 字段值异常：输出 `采集来源字段异常` 警告，但不阻断其余完整性核验流程。
+- 时间戳：
+`timestampToken` `timestampNonce`
+
+- 采集来源：
+`captureSource`
+
+## 兼容策略
+
+- 旧备份缺少新字段：脚本给出 `⚪` 或 `⚠️`，仍可完成核心完整性核验。
+- 字段存在但格式异常：标记 `⚠️` 或 `❌`，具体取决于是否影响关键校验路径。
 
 ## 免责声明 (Disclaimer)
 
