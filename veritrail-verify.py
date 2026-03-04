@@ -1,8 +1,10 @@
+import argparse
 import base64
 import binascii
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import ssl
@@ -11,7 +13,7 @@ import sys
 import tempfile
 import uuid
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     from asn1crypto import tsp
@@ -36,7 +38,10 @@ TSA_TIMESTAMPING_EKU_OID = "1.3.6.1.5.5.7.3.8"
 # iOS (Cocoa) 时间戳起始点: 2001-01-01 00:00:00 UTC
 COCOA_EPOCH_OFFSET = 978307200
 
-PROTOCOL_VERSION = "v1.3.0"
+PROTOCOL_VERSION = "v1.3.1"
+CURRENT_ENTRY_HASH_VERSION = 3
+MISSING_LOCATION_HASH_COMPONENT = "no_location_hash"
+MISSING_WITNESS_HASH_COMPONENT = "no_witness_hash"
 
 TRUST_STORE_ENV = "VERITRAIL_CA_BUNDLE"
 REQUIRE_TSA_EKU_ENV = "VERITRAIL_REQUIRE_TSA_EKU"
@@ -64,8 +69,10 @@ _TRUST_STORE_ERROR: Optional[str] = None
 
 KEYS = {
     "version": "version",
+    "case_id": "id",
     "cases": "cases",
     "entries": "entries",
+    "entry_id": "id",
     "timestamp": "timestamp",
     "rel_path": "relativeFilePath",
     "file_name": "fileName",
@@ -73,6 +80,8 @@ KEYS = {
     "file_hash": "fileHash",
     "prev_hash": "previousHash",
     "entry_hash": "entryHash",
+    "entry_hash_version": "entryHashVersion",
+    "location_hash": "locationHash",
     "case_name": "name",
     "signature": "signature",
     "public_key": "publicKey",
@@ -81,9 +90,27 @@ KEYS = {
     "device_system_version": "deviceSystemVersion",
     "device_fingerprint_id": "deviceFingerprintID",
     "device_signature_mode": "deviceSignatureMode",
+    "app_attest_status": "appAttestStatus",
+    "app_attest_key_id": "appAttestKeyID",
+    "app_attest_verification_id": "appAttestVerificationID",
+    "app_attest_verified_at": "appAttestVerifiedAt",
+    "app_attest_server_url": "appAttestServerURL",
+    "app_attest_error": "appAttestError",
+    "location_status": "locationStatus",
+    "location_confidence": "locationConfidence",
+    "location_risk_flags": "locationRiskFlags",
+    "location_latitude": "locationLatitude",
+    "location_longitude": "locationLongitude",
+    "location_accuracy_meters": "locationAccuracyMeters",
+    "location_captured_at": "locationCapturedAt",
+    "location_provider": "locationProvider",
+    "location_is_simulated_by_software": "locationIsSimulatedBySoftware",
+    "location_is_produced_by_accessory": "locationIsProducedByAccessory",
     "capture_monotonic_nanos": "captureMonotonicNanos",
     "capture_boot_session_id": "captureBootSessionID",
     "onsite_window_seconds": "onsiteWindowSeconds",
+    "witness_aggregate_hash": "witnessAggregateHash",
+    "witness_slots_data": "witnessSlotsData",
     "hardware_signature": "hardwareEndorsementSignature",
     "hardware_public_key": "hardwareEndorsementPublicKey",
     "hardware_certificate": "hardwareEndorsementCertificate",
@@ -107,6 +134,15 @@ DEVICE_SIGNATURE_MODE_LABELS = {
     "secure_enclave": "Secure Enclave（原生保护）",
     "software_fallback": "本地软件签名（安全降级）",
     "unknown": "未知",
+}
+
+APP_ATTEST_STATUS_LABELS = {
+    "not_attempted": "未执行",
+    "pending": "验签中",
+    "verified": "已通过",
+    "failed": "验签失败",
+    "disabled": "已关闭",
+    "unsupported": "设备不支持",
 }
 
 DEVICE_MODEL_CODE_LABELS = {
@@ -201,6 +237,42 @@ DEVICE_MODEL_CODE_LABELS = {
 HARDWARE_LEVEL_LABELS = {
     "onsite_witness": "现场身份亲签",
     "post_archived": "事后归档确认",
+}
+
+LOCATION_STATUS_LABELS = {
+    "captured": "已采集",
+    "unavailable": "不可用",
+    "permission_denied": "权限拒绝",
+    "timed_out": "超时",
+    "failed": "采集失败",
+}
+
+LOCATION_CONFIDENCE_LABELS = {
+    "high": "高",
+    "medium": "中",
+    "low": "低",
+    "untrusted": "不可信",
+    "unavailable": "不可用",
+}
+
+LOCATION_RISK_FLAG_LABELS = {
+    "simulated_by_software": "软件模拟定位",
+    "external_accessory": "外接定位源",
+    "low_accuracy": "定位精度较低",
+    "stale_sample": "定位样本过旧",
+    "speed_anomaly": "速度异常",
+    "device_compromised": "设备安全状态异常",
+    "location_services_disabled": "系统定位服务已关闭",
+    "location_permission_denied": "定位权限被拒绝",
+    "location_permission_not_determined": "定位权限未确定",
+    "location_authorization_unknown": "定位授权状态未知",
+    "location_request_already_active": "定位请求重复触发",
+    "location_timeout": "定位超时",
+    "timeout_fallback_cached": "超时后回退到缓存定位",
+    "prewarm_cache_hit": "命中预热定位缓存",
+    "location_not_available": "暂未获得可用定位",
+    "location_request_failed": "定位请求失败",
+    "invalid_accuracy": "定位精度数据异常",
 }
 
 
@@ -466,8 +538,319 @@ def timestamp_to_hash_iso8601(raw_value: Any) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def calculate_entry_hash(prev_hash: str, iso_date: str, file_hash: str, file_name: str, file_size: Any) -> str:
-    content = f"{prev_hash}|{iso_date}|{file_hash}|{file_name}|{str(file_size)}"
+def normalize_entry_hash_version(raw_value: Any) -> int:
+    if isinstance(raw_value, bool):
+        return 1
+    if isinstance(raw_value, int):
+        return max(1, raw_value)
+    if isinstance(raw_value, float) and raw_value.is_integer():
+        return max(1, int(raw_value))
+    if isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not text:
+            return 1
+        try:
+            return max(1, int(text))
+        except ValueError:
+            return 1
+    return 1
+
+
+def normalize_hex64(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", normalized):
+        return normalized
+    return None
+
+
+def normalize_uuid_text(value: Any) -> Optional[str]:
+    if isinstance(value, uuid.UUID):
+        return str(value).lower()
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return str(uuid.UUID(text)).lower()
+    except (ValueError, AttributeError):
+        return None
+
+
+def mask_text(value: Any, keep_head: int = 2, keep_tail: int = 2) -> str:
+    if value is None:
+        return "N/A"
+    text = str(value)
+    if text == "":
+        return "(空)"
+    if len(text) <= keep_head + keep_tail:
+        return "*" * len(text)
+    return f"{text[:keep_head]}***{text[-keep_tail:]}"
+
+
+def mask_email(value: Any) -> str:
+    if not isinstance(value, str) or "@" not in value:
+        return mask_text(value, 1, 1)
+
+    local, domain = value.split("@", 1)
+    if not local:
+        local_masked = "*"
+    elif len(local) == 1:
+        local_masked = "*"
+    else:
+        local_masked = local[0] + "***"
+
+    domain_masked = mask_text(domain, 1, 2)
+    return f"{local_masked}@{domain_masked}"
+
+
+def mask_identity_token(value: Any) -> str:
+    if not isinstance(value, str):
+        return "N/A"
+    parts = value.split(".")
+    if len(parts) == 3:
+        return f"{mask_text(parts[0], 4, 4)}.{mask_text(parts[1], 4, 4)}.{mask_text(parts[2], 3, 3)}"
+    return mask_text(value, 8, 6)
+
+
+def format_sensitive(value: Any, kind: str, reveal_pii: bool) -> str:
+    if reveal_pii:
+        if value is None:
+            return "N/A"
+        text = str(value)
+        return text if text else "(空)"
+
+    if kind == "email":
+        return mask_email(value)
+    if kind == "token":
+        return mask_identity_token(value)
+    return mask_text(value, 3, 3)
+
+
+def summarize_judicial_payload(payload: Any, reveal_pii: bool) -> str:
+    if not isinstance(payload, dict):
+        return "N/A"
+
+    mode_raw = payload.get("modeRaw", "N/A")
+    apple_user = format_sensitive(payload.get("appleUserID"), "user", reveal_pii)
+    email = format_sensitive(payload.get("email"), "email", reveal_pii)
+    token = format_sensitive(payload.get("identityToken"), "token", reveal_pii)
+    full_name = format_sensitive(payload.get("fullName"), "name", reveal_pii)
+    attested_at = format_date(payload.get("attestedAt"))
+    legal_statement = payload.get("legalStatementAccepted")
+
+    return (
+        f"mode={mode_raw}, appleUserID={apple_user}, email={email}, "
+        f"fullName={full_name}, identityToken={token}, "
+        f"attestedAt={attested_at}, legalStatementAccepted={legal_statement}"
+    )
+
+
+def format_iso8601_with_fractional(raw_value: Any) -> str:
+    dt = parse_date_value(raw_value)
+    if dt is None:
+        return "na"
+    dt_utc = dt.astimezone(datetime.timezone.utc)
+
+    # Match Foundation ISO8601DateFormatter(.withFractionalSeconds):
+    # round to nearest millisecond instead of truncating.
+    rounded_ms = int((dt_utc.microsecond + 500) // 1000)
+    if rounded_ms == 1000:
+        dt_utc = dt_utc + datetime.timedelta(seconds=1)
+        rounded_ms = 0
+    dt_utc = dt_utc.replace(microsecond=rounded_ms * 1000)
+
+    return dt_utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{rounded_ms:03d}Z"
+
+
+def calculate_pre_witness_entry_hash(entry: Dict[str, Any], hash_version: int) -> Optional[str]:
+    if hash_version < CURRENT_ENTRY_HASH_VERSION:
+        return None
+
+    prev_hash = entry.get(KEYS["prev_hash"])
+    file_hash = entry.get(KEYS["file_hash"])
+    file_name = entry.get(KEYS["file_name"])
+    file_size = entry.get(KEYS["file_size"])
+    iso_date = timestamp_to_hash_iso8601(entry.get(KEYS["timestamp"]))
+
+    if not isinstance(prev_hash, str):
+        return None
+    if not isinstance(file_hash, str):
+        return None
+    if not isinstance(file_name, str):
+        return None
+    if iso_date == "N/A":
+        return None
+
+    location_hash = normalize_hex64(entry.get(KEYS["location_hash"])) if hash_version >= 2 else None
+    if hash_version >= 2 and location_hash is None:
+        return None
+
+    return calculate_entry_hash(
+        prev_hash,
+        iso_date,
+        file_hash,
+        file_name,
+        file_size,
+        hash_version=hash_version,
+        location_hash=location_hash if hash_version >= 2 else None,
+        witness_hash=None,
+    )
+
+
+def format_location_decimal(value: Any, decimals: int) -> str:
+    if value is None:
+        return "na"
+
+    numeric: Optional[float]
+    if isinstance(value, bool):
+        return "na"
+    elif isinstance(value, (int, float)):
+        numeric = float(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return "na"
+        try:
+            numeric = float(text)
+        except ValueError:
+            return "na"
+    else:
+        return "na"
+
+    if numeric is None or not math.isfinite(numeric):
+        return "na"
+    return f"{numeric:.{decimals}f}"
+
+
+def normalize_optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off"):
+            return False
+    return None
+
+
+def location_bool_component(value: Optional[bool]) -> str:
+    if value is None:
+        return "na"
+    return "1" if value else "0"
+
+
+def parse_location_risk_flags(raw_value: Any) -> List[str]:
+    if not isinstance(raw_value, str) or raw_value == "":
+        return []
+    return [part for part in raw_value.split(",") if part != ""]
+
+
+def format_location_risk_flags(flags: List[str]) -> str:
+    if not flags:
+        return "无"
+    translated = [LOCATION_RISK_FLAG_LABELS.get(flag, flag) for flag in sorted(set(flags))]
+    return "、".join(translated)
+
+
+def calculate_location_hash_from_entry(entry: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], List[str], List[str]]:
+    warnings: List[str] = []
+    errors: List[str] = []
+
+    status_raw = entry.get(KEYS["location_status"])
+    confidence_raw = entry.get(KEYS["location_confidence"])
+
+    if not isinstance(status_raw, str) or not status_raw:
+        return None, None, warnings, errors
+    if not isinstance(confidence_raw, str) or not confidence_raw:
+        return None, None, warnings, errors
+
+    status_normalized = status_raw.strip().lower()
+    confidence_normalized = confidence_raw.strip().lower()
+
+    if status_normalized not in LOCATION_STATUS_LABELS:
+        warnings.append(f"locationStatus 取值未知: {status_raw}")
+        status_normalized = "unavailable"
+    if confidence_normalized not in LOCATION_CONFIDENCE_LABELS:
+        warnings.append(f"locationConfidence 取值未知: {confidence_raw}")
+        confidence_normalized = "unavailable"
+
+    provider_raw = entry.get(KEYS["location_provider"])
+    if isinstance(provider_raw, str) and provider_raw != "":
+        provider = provider_raw
+    else:
+        if provider_raw not in (None, ""):
+            warnings.append(f"locationProvider 类型异常: {provider_raw}")
+        provider = "core_location"
+
+    latitude_component = format_location_decimal(entry.get(KEYS["location_latitude"]), 7)
+    longitude_component = format_location_decimal(entry.get(KEYS["location_longitude"]), 7)
+    accuracy_component = format_location_decimal(entry.get(KEYS["location_accuracy_meters"]), 2)
+    captured_at_component = format_iso8601_with_fractional(entry.get(KEYS["location_captured_at"]))
+
+    simulated_value = normalize_optional_bool(entry.get(KEYS["location_is_simulated_by_software"]))
+    accessory_value = normalize_optional_bool(entry.get(KEYS["location_is_produced_by_accessory"]))
+
+    if entry.get(KEYS["location_is_simulated_by_software"]) is not None and simulated_value is None:
+        warnings.append("locationIsSimulatedBySoftware 类型异常")
+    if entry.get(KEYS["location_is_produced_by_accessory"]) is not None and accessory_value is None:
+        warnings.append("locationIsProducedByAccessory 类型异常")
+
+    risk_flags = parse_location_risk_flags(entry.get(KEYS["location_risk_flags"]))
+    sorted_flags = ",".join(sorted(set(risk_flags)))
+
+    canonical_payload = ";".join(
+        [
+            f"status={status_normalized}",
+            f"lat={latitude_component}",
+            f"lon={longitude_component}",
+            f"acc={accuracy_component}",
+            f"capturedAt={captured_at_component}",
+            f"simulated={location_bool_component(simulated_value)}",
+            f"accessory={location_bool_component(accessory_value)}",
+            f"confidence={confidence_normalized}",
+            f"provider={provider}",
+            f"flags={sorted_flags}",
+        ]
+    )
+
+    recalculated_hash = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest().lower()
+    return recalculated_hash, canonical_payload, warnings, errors
+
+
+def calculate_entry_hash(
+    prev_hash: str,
+    iso_date: str,
+    file_hash: str,
+    file_name: str,
+    file_size: Any,
+    hash_version: int = 1,
+    location_hash: Optional[str] = None,
+    witness_hash: Optional[str] = None,
+) -> str:
+    normalized_version = max(1, hash_version)
+    if normalized_version >= CURRENT_ENTRY_HASH_VERSION:
+        location_component = location_hash or MISSING_LOCATION_HASH_COMPONENT
+        witness_component = witness_hash or MISSING_WITNESS_HASH_COMPONENT
+        content = (
+            f"{prev_hash}|{iso_date}|{file_hash}|{file_name}|{str(file_size)}"
+            f"|v{normalized_version}|{location_component}|{witness_component}"
+        )
+    elif normalized_version == 2:
+        location_component = location_hash or MISSING_LOCATION_HASH_COMPONENT
+        content = (
+            f"{prev_hash}|{iso_date}|{file_hash}|{file_name}|{str(file_size)}"
+            f"|v2|{location_component}"
+        )
+    else:
+        content = f"{prev_hash}|{iso_date}|{file_hash}|{file_name}|{str(file_size)}"
     return hashlib.sha256(content.encode("utf-8")).hexdigest().lower()
 
 
@@ -476,6 +859,39 @@ def normalize_capture_source(raw_value: Any) -> Optional[str]:
         return None
     normalized = raw_value.strip().lower()
     return normalized if normalized in CAPTURE_SOURCE_LABELS else None
+
+
+def compute_witness_slot_packet_hash(
+    encrypted_evidence_packet: bytes,
+    session_id: Optional[str],
+    bound_entry_hash: Optional[str],
+    mode_raw: str,
+    alias_hash: Optional[str],
+    app_attest_status_raw: Optional[str],
+    app_attest_key_id: Optional[str],
+    app_attest_verification_id: Optional[str],
+    app_attest_verified_at: Any,
+    transport_raw: Optional[str],
+) -> str:
+    payload_digest = hashlib.sha256(encrypted_evidence_packet).hexdigest().lower()
+    verified_dt = parse_date_value(app_attest_verified_at)
+    verified_at_epoch = str(int(verified_dt.timestamp())) if verified_dt is not None else ""
+
+    canonical = "|".join(
+        [
+            f"payload={payload_digest}",
+            f"sid={session_id or ''}",
+            f"entry={(bound_entry_hash or '').lower()}",
+            f"mode={mode_raw}",
+            f"alias={alias_hash or ''}",
+            f"as={app_attest_status_raw or ''}",
+            f"ak={app_attest_key_id or ''}",
+            f"av={app_attest_verification_id or ''}",
+            f"at={verified_at_epoch}",
+            f"tp={transport_raw or ''}",
+        ]
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest().lower()
 
 
 def decode_b64(value: Any, field_name: str) -> Tuple[Optional[bytes], Optional[str]]:
@@ -1084,6 +1500,622 @@ def inspect_device_metadata(entry: Dict[str, Any]) -> Tuple[Optional[str], List[
     return summary, warnings
 
 
+def normalize_app_attest_status(raw_value: Any) -> Optional[str]:
+    if not isinstance(raw_value, str):
+        return None
+    normalized = raw_value.strip().lower()
+    if normalized in APP_ATTEST_STATUS_LABELS:
+        return normalized
+    return None
+
+
+def inspect_app_attest_metadata(entry: Dict[str, Any]) -> Tuple[Optional[str], List[str]]:
+    warnings: List[str] = []
+
+    status_raw = entry.get(KEYS["app_attest_status"])
+    key_id = entry.get(KEYS["app_attest_key_id"])
+    verification_id = entry.get(KEYS["app_attest_verification_id"])
+    verified_at = entry.get(KEYS["app_attest_verified_at"])
+    server_url = entry.get(KEYS["app_attest_server_url"])
+    error_message = entry.get(KEYS["app_attest_error"])
+
+    has_any = any(
+        value is not None
+        for value in (status_raw, key_id, verification_id, verified_at, server_url, error_message)
+    )
+    if not has_any:
+        return None, warnings
+
+    status = normalize_app_attest_status(status_raw)
+    if status is None:
+        if status_raw is None:
+            status_text = "状态未记录"
+            warnings.append("缺少 App Attest 状态 (appAttestStatus)")
+        else:
+            status_text = f"状态异常: {status_raw}"
+            warnings.append(f"App Attest 状态异常: {status_raw}")
+    else:
+        status_text = APP_ATTEST_STATUS_LABELS[status]
+
+    parts: List[str] = [status_text]
+
+    key_id_text = None
+    if key_id is not None:
+        if isinstance(key_id, str) and key_id.strip():
+            key_id_text = key_id.strip()
+            parts.append(f"keyID={key_id_text}")
+        else:
+            warnings.append("appAttestKeyID 类型或内容异常")
+
+    verification_id_text = None
+    if verification_id is not None:
+        if isinstance(verification_id, str) and verification_id.strip():
+            verification_id_text = verification_id.strip()
+            parts.append(f"verificationID={verification_id_text}")
+        else:
+            warnings.append("appAttestVerificationID 类型或内容异常")
+
+    verified_dt = parse_date_value(verified_at)
+    if verified_at is not None:
+        if verified_dt is None:
+            warnings.append(f"appAttestVerifiedAt 格式异常: {verified_at}")
+        else:
+            parts.append(f"verifiedAt={format_date(verified_at)}")
+
+    server_url_text = None
+    if server_url is not None:
+        if isinstance(server_url, str) and server_url.strip():
+            server_url_text = server_url.strip()
+            parts.append(f"server={server_url_text}")
+            if not server_url_text.startswith("https://"):
+                warnings.append(f"App Attest 服务地址不是 HTTPS: {server_url_text}")
+        else:
+            warnings.append("appAttestServerURL 类型或内容异常")
+
+    error_text = None
+    if error_message is not None:
+        if isinstance(error_message, str) and error_message.strip():
+            error_text = error_message.strip()
+            parts.append(f"error={error_text}")
+        else:
+            warnings.append("appAttestError 类型或内容异常")
+
+    if status == "verified":
+        if key_id_text is None:
+            warnings.append("App Attest 状态为 verified，但缺少 appAttestKeyID")
+        if verification_id_text is None:
+            warnings.append("App Attest 状态为 verified，但缺少 appAttestVerificationID")
+        if verified_dt is None:
+            warnings.append("App Attest 状态为 verified，但缺少或无法解析 appAttestVerifiedAt")
+        if error_text is not None:
+            warnings.append("App Attest 状态为 verified，但同时记录了 appAttestError")
+
+    if status == "failed" and error_text is None:
+        warnings.append("App Attest 状态为 failed，但缺少 appAttestError")
+
+    if status in ("disabled", "unsupported", "not_attempted"):
+        if verification_id_text is not None or verified_dt is not None:
+            warnings.append("App Attest 状态与回执字段不一致（含 verificationID/verifiedAt）")
+
+    if status in ("verified", "pending", "failed") and server_url_text is None:
+        warnings.append("缺少 App Attest 服务地址 (appAttestServerURL)")
+
+    summary = " • ".join(parts)
+    return summary, warnings
+
+
+def inspect_location_metadata(entry: Dict[str, Any], hash_version: int) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "present": False,
+        "lines": [],
+        "warnings": [],
+        "errors": [],
+        "recorded_hash": None,
+        "recalculated_hash": None,
+    }
+
+    location_fields = (
+        KEYS["location_hash"],
+        KEYS["location_status"],
+        KEYS["location_confidence"],
+        KEYS["location_risk_flags"],
+        KEYS["location_latitude"],
+        KEYS["location_longitude"],
+        KEYS["location_accuracy_meters"],
+        KEYS["location_captured_at"],
+        KEYS["location_provider"],
+        KEYS["location_is_simulated_by_software"],
+        KEYS["location_is_produced_by_accessory"],
+    )
+    result["present"] = any(entry.get(field) is not None for field in location_fields)
+
+    recorded_location_hash = normalize_hex64(entry.get(KEYS["location_hash"]))
+    raw_recorded_location_hash = entry.get(KEYS["location_hash"])
+    if raw_recorded_location_hash is not None and recorded_location_hash is None:
+        result["errors"].append("locationHash 不是有效 64 位十六进制")
+    result["recorded_hash"] = recorded_location_hash
+
+    status_raw = entry.get(KEYS["location_status"])
+    confidence_raw = entry.get(KEYS["location_confidence"])
+    status_normalized = status_raw.strip().lower() if isinstance(status_raw, str) else None
+    confidence_normalized = confidence_raw.strip().lower() if isinstance(confidence_raw, str) else None
+
+    if hash_version >= 2:
+        if recorded_location_hash is None:
+            result["errors"].append("entryHashVersion>=2 但缺少有效 locationHash")
+        if not isinstance(status_raw, str) or not status_raw:
+            result["errors"].append("entryHashVersion>=2 但缺少 locationStatus")
+        if not isinstance(confidence_raw, str) or not confidence_raw:
+            result["errors"].append("entryHashVersion>=2 但缺少 locationConfidence")
+
+    if status_normalized:
+        status_label = LOCATION_STATUS_LABELS.get(status_normalized, status_normalized)
+    else:
+        status_label = "未记录"
+    if confidence_normalized:
+        confidence_label = LOCATION_CONFIDENCE_LABELS.get(confidence_normalized, confidence_normalized)
+    else:
+        confidence_label = "未记录"
+
+    provider = entry.get(KEYS["location_provider"]) or "core_location"
+    latitude = entry.get(KEYS["location_latitude"])
+    longitude = entry.get(KEYS["location_longitude"])
+    accuracy = entry.get(KEYS["location_accuracy_meters"])
+    captured_at = format_date(entry.get(KEYS["location_captured_at"]))
+    risk_flags = parse_location_risk_flags(entry.get(KEYS["location_risk_flags"]))
+    risk_text = format_location_risk_flags(risk_flags)
+
+    result["lines"].append(
+        f"位置证据: 状态={status_label} • 置信度={confidence_label} • provider={provider}"
+    )
+    result["lines"].append(
+        f"位置数据: lat={latitude}, lon={longitude}, acc(m)={accuracy}, capturedAt={captured_at}"
+    )
+    result["lines"].append(f"位置风险标记: {risk_text}")
+
+    recalculated_hash, _, hash_warnings, hash_errors = calculate_location_hash_from_entry(entry)
+    result["warnings"].extend(hash_warnings)
+    result["errors"].extend(hash_errors)
+    result["recalculated_hash"] = recalculated_hash
+
+    if hash_version >= 2 and recorded_location_hash and recalculated_hash:
+        if recorded_location_hash != recalculated_hash:
+            result["errors"].append("locationHash 与位置元数据不一致（疑似篡改）")
+
+    if recorded_location_hash:
+        result["lines"].append(f"LocationHash(recorded)={recorded_location_hash}")
+    if recalculated_hash:
+        result["lines"].append(f"LocationHash(recalculated)={recalculated_hash}")
+
+    return result
+
+
+def inspect_witness_metadata(entry: Dict[str, Any], hash_version: int) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "present": False,
+        "lines": [],
+        "warnings": [],
+        "errors": [],
+        "recorded_hash": None,
+        "recalculated_hash": None,
+        "slot_count": 0,
+        "slots": [],
+        "slots_by_packet_hash": {},
+        "slots_by_id": {},
+    }
+
+    raw_witness_hash = entry.get(KEYS["witness_aggregate_hash"])
+    witness_hash = normalize_hex64(raw_witness_hash)
+    if raw_witness_hash is not None and witness_hash is None:
+        result["errors"].append("witnessAggregateHash 不是有效 64 位十六进制")
+    result["recorded_hash"] = witness_hash
+
+    raw_slots_data = entry.get(KEYS["witness_slots_data"])
+    if raw_slots_data is None:
+        if witness_hash is not None:
+            result["errors"].append("存在 witnessAggregateHash 但缺少 witnessSlotsData")
+        return result
+
+    result["present"] = True
+
+    slots_blob, decode_err = decode_b64(raw_slots_data, "witnessSlotsData")
+    if decode_err or slots_blob is None:
+        result["errors"].append(decode_err or "witnessSlotsData 解码失败")
+        return result
+
+    try:
+        decoded = json.loads(slots_blob.decode("utf-8"))
+    except Exception:
+        result["errors"].append("witnessSlotsData 不是有效 JSON")
+        return result
+
+    if not isinstance(decoded, list):
+        result["errors"].append("witnessSlotsData JSON 不是数组")
+        return result
+
+    entry_hash = normalize_hex64(entry.get(KEYS["entry_hash"]))
+    pre_witness_entry_hash = calculate_pre_witness_entry_hash(entry, hash_version)
+    packet_hashes: List[str] = []
+    for idx, slot in enumerate(decoded, start=1):
+        slot_label = f"见证槽[{idx}]"
+        if not isinstance(slot, dict):
+            result["errors"].append(f"{slot_label} 结构异常")
+            continue
+
+        slot_id = normalize_uuid_text(slot.get("id"))
+        if slot.get("id") is not None and slot_id is None:
+            result["errors"].append(f"{slot_label} id 非法（非 UUID）")
+
+        mode_raw = slot.get("modeRaw")
+        if not isinstance(mode_raw, str) or mode_raw.strip() == "":
+            result["warnings"].append(f"{slot_label} modeRaw 缺失或非法")
+            mode_raw = "unknown"
+        else:
+            mode_raw = mode_raw.strip()
+
+        session_id_raw = slot.get("sessionID")
+        if not isinstance(session_id_raw, str) or session_id_raw.strip() == "":
+            result["warnings"].append(f"{slot_label} sessionID 缺失或非法")
+            session_id = None
+        else:
+            session_id = session_id_raw.strip()
+
+        alias_hash_raw = slot.get("aliasHash")
+        alias_hash = normalize_hex64(alias_hash_raw) if alias_hash_raw is not None else None
+        if alias_hash_raw is not None and alias_hash is None:
+            result["warnings"].append(f"{slot_label} aliasHash 不是有效 64 位十六进制")
+
+        bound_hash_raw = slot.get("boundEntryHash")
+        bound_hash = normalize_hex64(bound_hash_raw) if bound_hash_raw is not None else None
+        if bound_hash_raw is not None and bound_hash is None:
+            result["warnings"].append(f"{slot_label} boundEntryHash 不是有效 64 位十六进制")
+        if bound_hash is not None and entry_hash is not None and bound_hash != entry_hash:
+            if pre_witness_entry_hash is not None and bound_hash == pre_witness_entry_hash:
+                # In current iOS flow, slot is bound to the pre-witness tail hash,
+                # then entry hash is resealed after witnessAggregateHash is updated.
+                pass
+            else:
+                result["errors"].append(f"{slot_label} boundEntryHash 与条目 entryHash 不一致")
+
+        packet_hash = normalize_hex64(slot.get("packetHash"))
+        if packet_hash is None:
+            result["errors"].append(f"{slot_label} packetHash 非法")
+
+        app_attest_verification_id = normalize_uuid_text(slot.get("appAttestVerificationID"))
+        if slot.get("appAttestVerificationID") is not None and app_attest_verification_id is None:
+            result["warnings"].append(f"{slot_label} appAttestVerificationID 非法（非 UUID）")
+        app_attest_status_raw_value = slot.get("appAttestStatusRaw")
+        if isinstance(app_attest_status_raw_value, str):
+            app_attest_status_raw_for_hash = app_attest_status_raw_value.strip() or None
+            app_attest_status = (app_attest_status_raw_for_hash or "").lower() or None
+        else:
+            app_attest_status_raw_for_hash = None
+            app_attest_status = None
+
+        app_attest_key_id_raw = slot.get("appAttestKeyID")
+        if isinstance(app_attest_key_id_raw, str):
+            app_attest_key_id = app_attest_key_id_raw.strip() or None
+        else:
+            app_attest_key_id = None
+            if app_attest_key_id_raw is not None:
+                result["warnings"].append(f"{slot_label} appAttestKeyID 类型异常")
+
+        app_attest_verified_at_raw = slot.get("appAttestVerifiedAt")
+        if app_attest_verified_at_raw is not None and parse_date_value(app_attest_verified_at_raw) is None:
+            result["warnings"].append(f"{slot_label} appAttestVerifiedAt 格式异常")
+
+        transport_raw_value = slot.get("transportRaw")
+        if isinstance(transport_raw_value, str):
+            transport_raw = transport_raw_value.strip() or None
+        else:
+            transport_raw = None
+            if transport_raw_value is not None:
+                result["warnings"].append(f"{slot_label} transportRaw 类型异常")
+
+        encrypted_packet, encrypted_err = decode_b64(slot.get("encryptedEvidencePacket"), f"{slot_label}.encryptedEvidencePacket")
+        recalculated_packet_hash: Optional[str] = None
+        if encrypted_err or encrypted_packet is None:
+            result["errors"].append(encrypted_err or f"{slot_label} encryptedEvidencePacket 解码失败")
+        else:
+            recalculated_packet_hash = compute_witness_slot_packet_hash(
+                encrypted_evidence_packet=encrypted_packet,
+                session_id=session_id,
+                bound_entry_hash=bound_hash,
+                mode_raw=mode_raw,
+                alias_hash=alias_hash,
+                app_attest_status_raw=app_attest_status_raw_for_hash,
+                app_attest_key_id=app_attest_key_id,
+                app_attest_verification_id=app_attest_verification_id,
+                app_attest_verified_at=app_attest_verified_at_raw,
+                transport_raw=transport_raw,
+            )
+            if packet_hash and recalculated_packet_hash != packet_hash:
+                result["errors"].append(f"{slot_label} packetHash 与密文包内容不一致")
+
+        slot_record = {
+            "slot_id": slot_id,
+            "packet_hash": packet_hash,
+            "session_id": session_id,
+            "mode_raw": mode_raw,
+            "alias_hash": alias_hash,
+            "bound_entry_hash": bound_hash,
+            "recalculated_packet_hash": recalculated_packet_hash,
+            "app_attest_verification_id": app_attest_verification_id,
+            "app_attest_status": app_attest_status,
+        }
+        result["slots"].append(slot_record)
+
+        if packet_hash:
+            packet_hashes.append(packet_hash)
+            if packet_hash in result["slots_by_packet_hash"]:
+                result["errors"].append(f"{slot_label} packetHash 与其他见证槽重复")
+            else:
+                result["slots_by_packet_hash"][packet_hash] = slot_record
+
+        if slot_id:
+            if slot_id in result["slots_by_id"]:
+                result["errors"].append(f"{slot_label} slotID 与其他见证槽重复")
+            else:
+                result["slots_by_id"][slot_id] = slot_record
+
+    result["slot_count"] = len(decoded)
+
+    if packet_hashes:
+        joined = "|".join(sorted(packet_hashes))
+        recalculated = hashlib.sha256(joined.encode("utf-8")).hexdigest().lower()
+        result["recalculated_hash"] = recalculated
+
+        if witness_hash is None:
+            result["errors"].append("存在 witnessSlotsData 但缺少 witnessAggregateHash")
+        elif witness_hash != recalculated:
+            result["errors"].append("witnessAggregateHash 与见证槽聚合结果不一致（疑似篡改）")
+
+    if result["slot_count"] == 0 and witness_hash is not None:
+        result["errors"].append("witnessSlotsData 为空但存在 witnessAggregateHash")
+
+    result["lines"].append(f"见证槽数量: {result['slot_count']}")
+    if witness_hash:
+        result["lines"].append(f"WitnessHash(recorded)={witness_hash}")
+    if result["recalculated_hash"]:
+        result["lines"].append(f"WitnessHash(recalculated)={result['recalculated_hash']}")
+
+    if hash_version >= CURRENT_ENTRY_HASH_VERSION and result["slot_count"] == 0 and witness_hash is not None:
+        result["warnings"].append("entryHashVersion>=3 下 witnessAggregateHash 已记录但见证槽为空")
+
+    return result
+
+
+def verify_judicial_manifest(
+    backup_root: str,
+    case_catalog: Dict[str, Dict[str, Any]],
+    reveal_pii: bool = False,
+) -> Tuple[int, int]:
+    print("\n" + "=" * 78)
+    print("⚖️ 司法导出附加核验")
+
+    warning_count = 0
+    error_count = 0
+
+    manifest_path = os.path.join(backup_root, "judicial_witnesses.json")
+    legal_notice_path = os.path.join(backup_root, "LEGAL_NOTICE.txt")
+
+    if not os.path.isfile(manifest_path):
+        print("❌ 缺少 judicial_witnesses.json（该包不是司法导出包，或导出不完整）")
+        return 1, 0
+
+    if not os.path.isfile(legal_notice_path):
+        print("❌ 缺少 LEGAL_NOTICE.txt（司法导出法律告知文件缺失）")
+        error_count += 1
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except Exception as exc:
+        print(f"❌ judicial_witnesses.json 读取失败: {exc}")
+        return 1 + error_count, warning_count
+
+    if not isinstance(manifest, dict):
+        print("❌ judicial_witnesses.json 顶层结构不是对象")
+        return 1 + error_count, warning_count
+
+    manifest_version = manifest.get("version")
+    if manifest_version != 1:
+        print(f"⚠️ 司法清单版本异常: {manifest_version}")
+        warning_count += 1
+
+    case_id = normalize_uuid_text(manifest.get("caseID"))
+    case_name = manifest.get("caseName", "Unknown")
+    if case_id is None:
+        print("❌ judicial_witnesses.json.caseID 非法")
+        return 1 + error_count, warning_count
+
+    print(f"📦 司法包案件: {case_name} ({case_id})")
+    print(f"🕒 导出时间: {format_date(manifest.get('exportedAt'))}")
+
+    case_record = case_catalog.get(case_id)
+    if case_record is None:
+        print("❌ data.json 中找不到与司法清单匹配的 caseID")
+        return 1 + error_count, warning_count
+
+    data_case_name = case_record.get("case_name")
+    if isinstance(data_case_name, str) and isinstance(case_name, str):
+        if data_case_name != case_name:
+            print(f"⚠️ caseName 不一致: data.json={data_case_name} / judicial={case_name}")
+            warning_count += 1
+
+    entries = manifest.get("entries")
+    if not isinstance(entries, list):
+        print("❌ judicial_witnesses.json.entries 不是数组")
+        return 1 + error_count, warning_count
+
+    entries_by_hash = case_record.get("entries_by_hash", {})
+    entries_by_id = case_record.get("entries_by_id", {})
+
+    for idx, judicial_entry in enumerate(entries, start=1):
+        entry_prefix = f"[司法条目 {idx}]"
+        if not isinstance(judicial_entry, dict):
+            print(f"{entry_prefix} ❌ 条目结构异常")
+            error_count += 1
+            continue
+
+        judicial_entry_hash = normalize_hex64(judicial_entry.get("entryHash"))
+        judicial_entry_id = normalize_uuid_text(judicial_entry.get("entryID"))
+        recorded_witness_hash = normalize_hex64(judicial_entry.get("witnessAggregateHash"))
+        witness_count = judicial_entry.get("witnessCount")
+        witness_records = judicial_entry.get("witnesses")
+
+        if judicial_entry_hash is None:
+            print(f"{entry_prefix} ❌ entryHash 非法")
+            error_count += 1
+            continue
+        if judicial_entry_id is None:
+            print(f"{entry_prefix} ❌ entryID 非法")
+            error_count += 1
+            continue
+        if not isinstance(witness_records, list):
+            print(f"{entry_prefix} ❌ witnesses 不是数组")
+            error_count += 1
+            continue
+        if not isinstance(witness_count, int) or witness_count < 0:
+            print(f"{entry_prefix} ❌ witnessCount 非法: {witness_count}")
+            error_count += 1
+            continue
+
+        data_entry = entries_by_hash.get(judicial_entry_hash)
+        if data_entry is None:
+            data_entry = entries_by_id.get(judicial_entry_id)
+        if data_entry is None:
+            print(f"{entry_prefix} ❌ 在 data.json 中找不到对应条目")
+            error_count += 1
+            continue
+
+        data_entry_hash = data_entry.get("entry_hash")
+        data_entry_id = data_entry.get("entry_id")
+        data_witness_hash = data_entry.get("witness_hash")
+        data_slot_count = data_entry.get("slot_count", 0)
+        data_slots_by_packet_hash = data_entry.get("slots_by_packet_hash", {})
+        data_slots_by_id = data_entry.get("slots_by_id", {})
+
+        print(f"{entry_prefix} entryHash={judicial_entry_hash}")
+
+        if data_entry_hash != judicial_entry_hash:
+            print(f"{entry_prefix} ❌ entryHash 与 data.json 不一致")
+            error_count += 1
+        if data_entry_id != judicial_entry_id:
+            print(f"{entry_prefix} ❌ entryID 与 data.json 不一致")
+            error_count += 1
+
+        if recorded_witness_hash is None and witness_count > 0:
+            print(f"{entry_prefix} ❌ 有见证记录但 witnessAggregateHash 缺失")
+            error_count += 1
+        elif recorded_witness_hash is not None and data_witness_hash is not None and recorded_witness_hash != data_witness_hash:
+            print(f"{entry_prefix} ❌ witnessAggregateHash 与 data.json 不一致")
+            error_count += 1
+
+        if witness_count != len(witness_records):
+            print(f"{entry_prefix} ❌ witnessCount={witness_count} 与 witnesses 数组长度={len(witness_records)} 不一致")
+            error_count += 1
+
+        if witness_count != data_slot_count:
+            print(f"{entry_prefix} ❌ witnessCount={witness_count} 与 data.json 见证槽数量={data_slot_count} 不一致")
+            error_count += 1
+
+        manifest_packet_hashes: List[str] = []
+        for widx, witness in enumerate(witness_records, start=1):
+            witness_prefix = f"{entry_prefix}/见证[{widx}]"
+            if not isinstance(witness, dict):
+                print(f"{witness_prefix} ❌ 结构异常")
+                error_count += 1
+                continue
+
+            slot_id = normalize_uuid_text(witness.get("slotID"))
+            packet_hash = normalize_hex64(witness.get("packetHash"))
+            session_id = witness.get("sessionID")
+            mode = witness.get("mode")
+            alias_hash = normalize_hex64(witness.get("aliasHash")) if witness.get("aliasHash") is not None else None
+
+            if slot_id is None:
+                print(f"{witness_prefix} ❌ slotID 非法")
+                error_count += 1
+                continue
+            if packet_hash is None:
+                print(f"{witness_prefix} ❌ packetHash 非法")
+                error_count += 1
+                continue
+            if not isinstance(session_id, str) or not session_id.strip():
+                print(f"{witness_prefix} ❌ sessionID 非法")
+                error_count += 1
+                continue
+            if not isinstance(mode, str) or not mode.strip():
+                print(f"{witness_prefix} ❌ mode 非法")
+                error_count += 1
+                continue
+
+            manifest_packet_hashes.append(packet_hash)
+            data_slot = data_slots_by_packet_hash.get(packet_hash) or data_slots_by_id.get(slot_id)
+            if data_slot is None:
+                print(f"{witness_prefix} ❌ 在 data.json 的 witnessSlotsData 中找不到对应槽位")
+                error_count += 1
+                continue
+
+            data_slot_id = data_slot.get("slot_id")
+            data_packet_hash = data_slot.get("packet_hash")
+            data_session_id = data_slot.get("session_id")
+            data_mode_raw = data_slot.get("mode_raw")
+            data_alias_hash = data_slot.get("alias_hash")
+
+            if data_slot_id and data_slot_id != slot_id:
+                print(f"{witness_prefix} ❌ slotID 与 data.json 不一致")
+                error_count += 1
+            if data_packet_hash and data_packet_hash != packet_hash:
+                print(f"{witness_prefix} ❌ packetHash 与 data.json 不一致")
+                error_count += 1
+            if isinstance(data_session_id, str) and data_session_id != session_id:
+                print(f"{witness_prefix} ❌ sessionID 与 data.json 不一致")
+                error_count += 1
+            if isinstance(data_mode_raw, str) and data_mode_raw != mode:
+                print(f"{witness_prefix} ❌ mode 与 data.json 不一致")
+                error_count += 1
+            if data_alias_hash is not None and alias_hash is not None and data_alias_hash != alias_hash:
+                print(f"{witness_prefix} ❌ aliasHash 与 data.json 不一致")
+                error_count += 1
+
+            decrypted_payload = witness.get("decryptedPayload")
+            decrypt_error = witness.get("decryptError")
+
+            if decrypted_payload is not None and decrypt_error not in (None, ""):
+                print(f"{witness_prefix} ❌ decryptedPayload 与 decryptError 同时存在")
+                error_count += 1
+            elif decrypted_payload is None and decrypt_error in (None, ""):
+                print(f"{witness_prefix} ⚠️ decryptedPayload 与 decryptError 同时为空（信息不足）")
+                warning_count += 1
+
+            if decrypted_payload is not None:
+                print(f"{witness_prefix} 🔎 解密摘要: {summarize_judicial_payload(decrypted_payload, reveal_pii)}")
+            elif isinstance(decrypt_error, str) and decrypt_error.strip():
+                print(f"{witness_prefix} ⚠️ 解密失败: {mask_text(decrypt_error, 8, 8)}")
+
+        data_packet_set = set(data_slots_by_packet_hash.keys())
+        manifest_packet_set = set(manifest_packet_hashes)
+        missing_from_manifest = data_packet_set - manifest_packet_set
+        extra_in_manifest = manifest_packet_set - data_packet_set
+        if missing_from_manifest:
+            print(f"{entry_prefix} ❌ 司法清单缺少 {len(missing_from_manifest)} 个 data.json 中的见证槽")
+            error_count += 1
+        if extra_in_manifest:
+            print(f"{entry_prefix} ❌ 司法清单包含 {len(extra_in_manifest)} 个 data.json 中不存在的见证槽")
+            error_count += 1
+
+    if error_count == 0:
+        print("✅ 司法清单与 data.json 交叉核验通过")
+    else:
+        print(f"❌ 司法清单核验失败，共 {error_count} 处关键错误")
+    if warning_count > 0:
+        print(f"⚠️ 司法清单核验警告 {warning_count} 条")
+
+    return error_count, warning_count
+
+
 def inspect_onsite_window_metadata(entry: Dict[str, Any]) -> Tuple[Optional[str], List[str]]:
     warnings: List[str] = []
 
@@ -1222,6 +2254,296 @@ def verify_hardware_endorsement(entry: Dict[str, Any], entry_hash: str, entry_ti
     return result
 
 
+def verify_app_attest_report(
+    report_path: str,
+    case_catalog: Dict[str, Dict[str, Any]],
+) -> Tuple[int, int]:
+    print("\n" + "=" * 78)
+    print("🍎 App Attest 服务端报告交叉核验")
+
+    if not os.path.isfile(report_path):
+        print(f"❌ 报告文件不存在: {report_path}")
+        return 1, 0
+
+    try:
+        with open(report_path, "r", encoding="utf-8") as f:
+            report = json.load(f)
+    except Exception as exc:
+        print(f"❌ App Attest 报告读取失败: {exc}")
+        return 1, 0
+
+    if not isinstance(report, dict):
+        print("❌ App Attest 报告顶层结构不是对象")
+        return 1, 0
+
+    schema_version = report.get("schemaVersion")
+    print(f"📄 报告 schemaVersion: {schema_version}")
+
+    if schema_version == "app-attest-judicial-report.v2":
+        return verify_app_attest_report_v2(report, case_catalog)
+    if schema_version == "app-attest-judicial-report.v1":
+        return verify_app_attest_report_v1(report, case_catalog)
+
+    print("❌ 不支持的 App Attest 报告版本")
+    return 1, 0
+
+
+def verify_app_attest_report_v1(
+    report: Dict[str, Any],
+    case_catalog: Dict[str, Dict[str, Any]],
+) -> Tuple[int, int]:
+    error_count = 0
+    warning_count = 0
+
+    request = report.get("request")
+    if not isinstance(request, dict):
+        print("❌ v1 报告缺少 request 对象")
+        return 1, 0
+
+    case_id = normalize_uuid_text(request.get("caseId"))
+    entry_hash = normalize_hex64(request.get("entryHash"))
+    if case_id is None:
+        print("❌ v1 报告 request.caseId 非法")
+        return 1, 0
+    if entry_hash is None:
+        print("❌ v1 报告 request.entryHash 非法")
+        return 1, 0
+
+    case_record = case_catalog.get(case_id)
+    if case_record is None:
+        print("❌ v1 报告 caseId 在 data.json 中不存在")
+        return 1, 0
+
+    local_hashes = case_record.get("case_entry_hashes", set())
+    if entry_hash not in local_hashes:
+        print("❌ v1 报告 request.entryHash 不属于该案件")
+        error_count += 1
+    else:
+        print("✅ request.entryHash 与案件条目匹配")
+
+    assertions = report.get("assertions")
+    if not isinstance(assertions, list):
+        print("❌ v1 报告 assertions 不是数组")
+        return error_count + 1, warning_count
+
+    for idx, item in enumerate(assertions, start=1):
+        if not isinstance(item, dict):
+            print(f"❌ assertions[{idx}] 结构非法")
+            error_count += 1
+            continue
+        row_entry_hash = normalize_hex64(item.get("entryHash"))
+        if row_entry_hash != entry_hash:
+            print(f"❌ assertions[{idx}] entryHash 与 request.entryHash 不一致")
+            error_count += 1
+
+    if error_count == 0:
+        print("✅ v1 报告与案件包交叉核验通过")
+
+    return error_count, warning_count
+
+
+def verify_app_attest_report_v2(
+    report: Dict[str, Any],
+    case_catalog: Dict[str, Dict[str, Any]],
+) -> Tuple[int, int]:
+    error_count = 0
+    warning_count = 0
+
+    request = report.get("request")
+    if not isinstance(request, dict):
+        print("❌ v2 报告缺少 request 对象")
+        return 1, 0
+
+    case_id = normalize_uuid_text(request.get("caseId"))
+    if case_id is None:
+        print("❌ v2 报告 request.caseId 非法")
+        return 1, 0
+
+    case_record = case_catalog.get(case_id)
+    if case_record is None:
+        print("❌ v2 报告 caseId 在 data.json 中不存在")
+        return 1, 0
+
+    local_entry_hashes = set(case_record.get("case_entry_hashes", set()))
+    local_anchor_map = case_record.get("witness_anchors_by_verification_id", {})
+    if not isinstance(local_anchor_map, dict):
+        local_anchor_map = {}
+
+    scope = report.get("scope")
+    if not isinstance(scope, dict):
+        print("❌ v2 报告缺少 scope 对象")
+        return 1, 0
+
+    scope_entry_hashes_raw = scope.get("caseEntryHashes")
+    if not isinstance(scope_entry_hashes_raw, list):
+        print("❌ v2 报告 scope.caseEntryHashes 不是数组")
+        return 1, 0
+
+    scope_entry_hashes: List[str] = []
+    seen_scope_hashes: Set[str] = set()
+    for idx, raw in enumerate(scope_entry_hashes_raw, start=1):
+        normalized = normalize_hex64(raw)
+        if normalized is None:
+            print(f"❌ scope.caseEntryHashes[{idx}] 非法")
+            error_count += 1
+            continue
+        if normalized not in seen_scope_hashes:
+            seen_scope_hashes.add(normalized)
+            scope_entry_hashes.append(normalized)
+
+    missing_in_local = [h for h in scope_entry_hashes if h not in local_entry_hashes]
+    if missing_in_local:
+        print(f"❌ scope.caseEntryHashes 有 {len(missing_in_local)} 条不属于该案件")
+        error_count += len(missing_in_local)
+    else:
+        print(f"✅ scope.caseEntryHashes 共 {len(scope_entry_hashes)} 条，均可在案件包中匹配")
+
+    local_not_in_scope = sorted(local_entry_hashes - set(scope_entry_hashes))
+    if local_not_in_scope:
+        print(f"⚠️ 案件中有 {len(local_not_in_scope)} 条 entryHash 未纳入 scope.caseEntryHashes")
+        warning_count += len(local_not_in_scope)
+
+    case_assertions = report.get("caseAssertions")
+    if not isinstance(case_assertions, list):
+        print("❌ v2 报告 caseAssertions 不是数组")
+        return error_count + 1, warning_count
+
+    seen_case_assertion_ids: Set[str] = set()
+    for idx, item in enumerate(case_assertions, start=1):
+        if not isinstance(item, dict):
+            print(f"❌ caseAssertions[{idx}] 结构非法")
+            error_count += 1
+            continue
+        verification_id = normalize_uuid_text(item.get("verificationId"))
+        entry_hash = normalize_hex64(item.get("entryHash"))
+        if verification_id is None:
+            print(f"❌ caseAssertions[{idx}] verificationId 非法")
+            error_count += 1
+        elif verification_id in seen_case_assertion_ids:
+            print(f"❌ caseAssertions[{idx}] verificationId 重复")
+            error_count += 1
+        else:
+            seen_case_assertion_ids.add(verification_id)
+        if entry_hash is None:
+            print(f"❌ caseAssertions[{idx}] entryHash 非法")
+            error_count += 1
+            continue
+        if entry_hash not in local_entry_hashes:
+            print(f"❌ caseAssertions[{idx}] entryHash 不属于案件")
+            error_count += 1
+        if entry_hash not in seen_scope_hashes:
+            print(f"❌ caseAssertions[{idx}] entryHash 不在 scope.caseEntryHashes 中")
+            error_count += 1
+
+    scope_witness_anchors = scope.get("witnessAnchors")
+    if scope_witness_anchors is not None and not isinstance(scope_witness_anchors, list):
+        print("❌ v2 报告 scope.witnessAnchors 不是数组")
+        error_count += 1
+        scope_witness_anchors = []
+    if scope_witness_anchors is None:
+        scope_witness_anchors = []
+
+    for idx, item in enumerate(scope_witness_anchors, start=1):
+        if not isinstance(item, dict):
+            print(f"❌ scope.witnessAnchors[{idx}] 结构非法")
+            error_count += 1
+            continue
+        verification_id = normalize_uuid_text(item.get("appAttestVerificationId"))
+        bound_entry_hash = normalize_hex64(item.get("boundEntryHash"))
+        if verification_id is None:
+            print(f"❌ scope.witnessAnchors[{idx}] appAttestVerificationId 非法")
+            error_count += 1
+            continue
+        if bound_entry_hash is None:
+            print(f"❌ scope.witnessAnchors[{idx}] boundEntryHash 非法")
+            error_count += 1
+            continue
+        local_anchor = local_anchor_map.get(verification_id)
+        if local_anchor is None:
+            print(f"⚠️ scope.witnessAnchors[{idx}] 在案件包见证槽中找不到同 verificationId")
+            warning_count += 1
+            continue
+        local_bound_hash = normalize_hex64(local_anchor.get("bound_entry_hash"))
+        if local_bound_hash != bound_entry_hash:
+            print(f"❌ scope.witnessAnchors[{idx}] boundEntryHash 与案件包不一致")
+            error_count += 1
+
+    witness_assertions = report.get("witnessAssertions")
+    if not isinstance(witness_assertions, list):
+        print("❌ v2 报告 witnessAssertions 不是数组")
+        return error_count + 1, warning_count
+
+    seen_witness_assertion_ids: Set[str] = set()
+    for idx, item in enumerate(witness_assertions, start=1):
+        if not isinstance(item, dict):
+            print(f"❌ witnessAssertions[{idx}] 结构非法")
+            error_count += 1
+            continue
+        anchor = item.get("anchor")
+        assertion = item.get("assertion")
+        match_status = item.get("matchStatus")
+        if not isinstance(anchor, dict):
+            print(f"❌ witnessAssertions[{idx}].anchor 非法")
+            error_count += 1
+            continue
+        anchor_verification_id = normalize_uuid_text(anchor.get("appAttestVerificationId"))
+        anchor_bound_hash = normalize_hex64(anchor.get("boundEntryHash"))
+        if anchor_verification_id is None or anchor_bound_hash is None:
+            print(f"❌ witnessAssertions[{idx}].anchor 关键字段非法")
+            error_count += 1
+            continue
+        if anchor_verification_id in seen_witness_assertion_ids:
+            print(f"❌ witnessAssertions[{idx}] anchor.appAttestVerificationId 重复")
+            error_count += 1
+        else:
+            seen_witness_assertion_ids.add(anchor_verification_id)
+
+        local_anchor = local_anchor_map.get(anchor_verification_id)
+        if local_anchor is not None:
+            local_bound_hash = normalize_hex64(local_anchor.get("bound_entry_hash"))
+            if local_bound_hash != anchor_bound_hash:
+                print(f"❌ witnessAssertions[{idx}] anchor.boundEntryHash 与案件包不一致")
+                error_count += 1
+        else:
+            warning_count += 1
+            print(f"⚠️ witnessAssertions[{idx}] 在案件包见证槽中找不到同 verificationId")
+
+        if match_status == "matched" and not isinstance(assertion, dict):
+            print(f"❌ witnessAssertions[{idx}] 标记 matched 但 assertion 为空")
+            error_count += 1
+        if isinstance(assertion, dict):
+            assertion_verification_id = normalize_uuid_text(assertion.get("verificationId"))
+            assertion_entry_hash = normalize_hex64(assertion.get("entryHash"))
+            if assertion_verification_id != anchor_verification_id:
+                print(f"❌ witnessAssertions[{idx}] assertion.verificationId 与 anchor 不一致")
+                error_count += 1
+            if assertion_entry_hash is None:
+                print(f"❌ witnessAssertions[{idx}] assertion.entryHash 非法")
+                error_count += 1
+
+    summary = report.get("summary")
+    if isinstance(summary, dict):
+        summary_case = summary.get("caseAssertions")
+        if isinstance(summary_case, dict):
+            total_claimed = summary_case.get("total")
+            if isinstance(total_claimed, int) and total_claimed != len(case_assertions):
+                print("⚠️ summary.caseAssertions.total 与 caseAssertions 数量不一致")
+                warning_count += 1
+        summary_witness = summary.get("witnessAnchors")
+        if isinstance(summary_witness, dict):
+            total_claimed = summary_witness.get("total")
+            if isinstance(total_claimed, int):
+                anchors_count = len(scope_witness_anchors)
+                if total_claimed != anchors_count:
+                    print("⚠️ summary.witnessAnchors.total 与 scope.witnessAnchors 数量不一致")
+                    warning_count += 1
+
+    if error_count == 0:
+        print("✅ v2 报告与案件包交叉核验通过")
+
+    return error_count, warning_count
+
+
 def entry_sort_key(entry: Dict[str, Any]) -> float:
     dt = parse_date_value(entry.get(KEYS["timestamp"]))
     if dt is None:
@@ -1229,7 +2551,12 @@ def entry_sort_key(entry: Dict[str, Any]) -> float:
     return dt.timestamp()
 
 
-def verify_backup(backup_root: str) -> None:
+def verify_backup(
+    backup_root: str,
+    mode: str = "standard",
+    reveal_pii: bool = False,
+    attest_report_path: Optional[str] = None,
+) -> None:
     json_path = os.path.join(backup_root, "data.json")
     files_root = os.path.join(backup_root, "files")
     require_tsa_eku, allow_tsa_sha1 = get_runtime_tsa_policy()
@@ -1258,13 +2585,18 @@ def verify_backup(backup_root: str) -> None:
     print(
         f"TSA policy: requireEKU={require_tsa_eku}, allowSHA1={allow_tsa_sha1}, trustStoreEnv={TRUST_STORE_ENV}"
     )
+    print(f"Verification mode: {mode} (revealPII={reveal_pii})")
+    if attest_report_path:
+        print(f"App Attest report: {attest_report_path}")
     print("=" * 78)
 
     total_error_entries = 0
     total_warnings = 0
+    case_catalog: Dict[str, Dict[str, Any]] = {}
 
     for case_idx, case in enumerate(cases, start=1):
         case_name = case.get(KEYS["case_name"], "Unknown")
+        case_id = normalize_uuid_text(case.get(KEYS["case_id"]))
         entries = case.get(KEYS["entries"], [])
         if not isinstance(entries, list):
             print(f"\n案件 [{case_idx}/{len(cases)}]: {case_name}")
@@ -1272,6 +2604,19 @@ def verify_backup(backup_root: str) -> None:
             print("    ❌ 案件 entries 字段不是数组")
             total_error_entries += 1
             continue
+
+        if case_id is None:
+            case_id = f"invalid-case-{case_idx}"
+
+        case_record = {
+            "case_id": case_id,
+            "case_name": case_name,
+            "entries_by_hash": {},
+            "entries_by_id": {},
+            "case_entry_hashes": set(),
+            "witness_anchors_by_verification_id": {},
+        }
+        case_catalog[case_id] = case_record
 
         entries = sorted(entries, key=entry_sort_key)
 
@@ -1289,6 +2634,11 @@ def verify_backup(backup_root: str) -> None:
             rec_file_hash = entry.get(KEYS["file_hash"], "")
             rec_prev_hash = entry.get(KEYS["prev_hash"], "")
             rec_entry_hash = entry.get(KEYS["entry_hash"], "")
+            rec_entry_hash_normalized = normalize_hex64(rec_entry_hash)
+            entry_id_normalized = normalize_uuid_text(entry.get(KEYS["entry_id"]))
+            entry_hash_version = normalize_entry_hash_version(entry.get(KEYS["entry_hash_version"]))
+            rec_location_hash = normalize_hex64(entry.get(KEYS["location_hash"]))
+            rec_witness_hash = normalize_hex64(entry.get(KEYS["witness_aggregate_hash"]))
             ts_token_b64 = entry.get(KEYS["ts_token"])
             ts_nonce = entry.get(KEYS["ts_nonce"])
             capture_source_raw = entry.get(KEYS["capture_source"])
@@ -1296,6 +2646,7 @@ def verify_backup(backup_root: str) -> None:
             iso_date = timestamp_to_hash_iso8601(timestamp_raw)
             print(f"[{i}] {fname}")
             print(f"    🕒 记录时间: {format_date(timestamp_raw)}")
+            print(f"    🔢 条目哈希版本: v{entry_hash_version}")
 
             capture_source = normalize_capture_source(capture_source_raw)
             if capture_source:
@@ -1304,6 +2655,65 @@ def verify_backup(backup_root: str) -> None:
                 print("    ⚪ 采集来源: 未记录 (旧版本备份)")
             else:
                 entry_warnings.append(f"采集来源字段异常: {capture_source_raw}")
+
+            location_result = inspect_location_metadata(entry, entry_hash_version)
+            if location_result["present"] or entry_hash_version >= CURRENT_ENTRY_HASH_VERSION:
+                for line in location_result["lines"]:
+                    print(f"    📡 {line}")
+                entry_warnings.extend(location_result["warnings"])
+                entry_errors.extend(location_result["errors"])
+            else:
+                print("    ⚪ 位置证据: 未记录 (legacy)")
+
+            witness_result = inspect_witness_metadata(entry, entry_hash_version)
+            if witness_result["present"] or rec_witness_hash is not None:
+                for line in witness_result["lines"]:
+                    print(f"    👥 {line}")
+                entry_warnings.extend(witness_result["warnings"])
+                entry_errors.extend(witness_result["errors"])
+            elif entry_hash_version >= CURRENT_ENTRY_HASH_VERSION:
+                if i == len(entries):
+                    print("    ⚪ 见证槽: 未记录（尾条当前尚无见证回传）")
+                else:
+                    print("    ⚪ 见证槽: 未记录（默认仅尾条写入，本条无见证属正常）")
+
+            entry_record = {
+                "entry_id": entry_id_normalized,
+                "entry_hash": rec_entry_hash_normalized,
+                "witness_hash": witness_result["recorded_hash"],
+                "slot_count": witness_result["slot_count"],
+                "slots": witness_result["slots"],
+                "slots_by_packet_hash": witness_result["slots_by_packet_hash"],
+                "slots_by_id": witness_result["slots_by_id"],
+            }
+            if rec_entry_hash_normalized:
+                if rec_entry_hash_normalized in case_record["entries_by_hash"]:
+                    entry_warnings.append("同一案件中存在重复 entryHash")
+                case_record["entries_by_hash"][rec_entry_hash_normalized] = entry_record
+                case_record["case_entry_hashes"].add(rec_entry_hash_normalized)
+            else:
+                entry_warnings.append("entryHash 非法，无法用于司法清单交叉核验")
+            if entry_id_normalized:
+                if entry_id_normalized in case_record["entries_by_id"]:
+                    entry_warnings.append("同一案件中存在重复 entryID")
+                case_record["entries_by_id"][entry_id_normalized] = entry_record
+
+            for slot_record in witness_result["slots"]:
+                verification_id = slot_record.get("app_attest_verification_id")
+                bound_entry_hash = slot_record.get("bound_entry_hash")
+                if verification_id is None or bound_entry_hash is None:
+                    continue
+                if verification_id in case_record["witness_anchors_by_verification_id"]:
+                    entry_warnings.append("同一案件中存在重复 witness appAttestVerificationID")
+                    continue
+                case_record["witness_anchors_by_verification_id"][verification_id] = {
+                    "entry_hash": rec_entry_hash_normalized,
+                    "bound_entry_hash": bound_entry_hash,
+                    "slot_id": slot_record.get("slot_id"),
+                    "session_id": slot_record.get("session_id"),
+                    "mode_raw": slot_record.get("mode_raw"),
+                    "app_attest_status": slot_record.get("app_attest_status"),
+                }
 
             # 文件完整性
             real_file_path, rel_path_err = resolve_file_in_backup(files_root, rel_path)
@@ -1329,9 +2739,20 @@ def verify_backup(backup_root: str) -> None:
                 print("    ✅ 创世节点")
 
             # 条目哈希
-            calc_entry_hash = calculate_entry_hash(rec_prev_hash, iso_date, rec_file_hash, fname, fsize)
-            if calc_entry_hash != rec_entry_hash:
-                entry_errors.append("条目哈希不匹配 (元数据可能被篡改)")
+            calc_entry_hash = calculate_entry_hash(
+                rec_prev_hash,
+                iso_date,
+                rec_file_hash,
+                fname,
+                fsize,
+                hash_version=entry_hash_version,
+                location_hash=rec_location_hash if entry_hash_version >= 2 else None,
+                witness_hash=rec_witness_hash if entry_hash_version >= CURRENT_ENTRY_HASH_VERSION else None,
+            )
+            if not rec_entry_hash_normalized:
+                entry_errors.append("entryHash 不是有效 64 位十六进制")
+            elif calc_entry_hash != rec_entry_hash_normalized:
+                entry_errors.append(f"条目哈希不匹配 (v{entry_hash_version} 元数据可能被篡改)")
             else:
                 print("    ✅ 指纹验证通过")
 
@@ -1353,6 +2774,12 @@ def verify_backup(backup_root: str) -> None:
                 entry_warnings.append("主签名字段不完整 (signature/publicKey 仅存在一项)")
             else:
                 print("    ⚪ 无主签名")
+
+            # App Attest 远程验签回执（审计信息）
+            app_attest_summary, app_attest_warnings = inspect_app_attest_metadata(entry)
+            if app_attest_summary:
+                print(f"    🍎 App Attest 远程验签: {app_attest_summary}")
+            entry_warnings.extend(app_attest_warnings)
 
             # 设备签名元数据
             metadata_summary, metadata_warnings = inspect_device_metadata(entry)
@@ -1402,6 +2829,23 @@ def verify_backup(backup_root: str) -> None:
 
             total_warnings += len(entry_warnings)
 
+    if mode == "judicial":
+        judicial_errors, judicial_warnings = verify_judicial_manifest(
+            backup_root,
+            case_catalog,
+            reveal_pii=reveal_pii,
+        )
+        total_error_entries += judicial_errors
+        total_warnings += judicial_warnings
+
+    if attest_report_path:
+        report_errors, report_warnings = verify_app_attest_report(
+            attest_report_path,
+            case_catalog,
+        )
+        total_error_entries += report_errors
+        total_warnings += report_warnings
+
     print("\n" + "=" * 78)
     if total_error_entries == 0:
         print("🏆 验证成功! 所有关键校验项通过。")
@@ -1414,12 +2858,40 @@ def verify_backup(backup_root: str) -> None:
         sys.exit(1)
 
 
-def main() -> None:
-    if len(sys.argv) < 2:
-        print("用法: python3 veritrail-verify.py <备份文件夹路径>")
-        sys.exit(1)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="VeriTrail 备份核验脚本（支持标准模式与司法模式）"
+    )
+    parser.add_argument(
+        "backup_path",
+        help="备份目录路径（目录内应包含 data.json 与 files/）",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["standard", "judicial"],
+        default="standard",
+        help="核验模式：standard=常规完整性核验；judicial=额外核验 judicial_witnesses.json",
+    )
+    parser.add_argument(
+        "--reveal-pii",
+        action="store_true",
+        help="司法模式下显示明文身份信息（默认脱敏）",
+    )
+    parser.add_argument(
+        "--attest-report",
+        help="可选：服务端导出的 App Attest 报告 JSON 路径（支持 v1/v2，执行交叉核验）",
+    )
+    return parser.parse_args()
 
-    verify_backup(sys.argv[1])
+
+def main() -> None:
+    args = parse_args()
+    verify_backup(
+        args.backup_path,
+        mode=args.mode,
+        reveal_pii=args.reveal_pii,
+        attest_report_path=args.attest_report,
+    )
 
 
 if __name__ == "__main__":
